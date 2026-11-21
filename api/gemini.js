@@ -9,15 +9,14 @@ module.exports = async function handler(req, res) {
 
   const apiKey = process.env.GEMINI_API_KEY;
 
-  // 주소창에 /api/gemini를 열었을 때 한국어로 상태 확인
   if (req.method === 'GET') {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     return res.status(200).json({
       server: '정상 작동 중',
       apiKeyConnected: Boolean(apiKey),
       message: apiKey
-        ? '완벽합니다! 서버와 API 키가 모두 연결되어 누구나 AI를 쓸 수 있어요.'
-        : '서버는 고쳐졌어요! 이제 3단계대로 Vercel에 GEMINI_API_KEY만 넣어주세요.'
+        ? '완벽합니다! 자동 우회 모드로 누구나 AI를 쓸 수 있어요.'
+        : 'Vercel에 GEMINI_API_KEY를 먼저 등록해 주세요.'
     });
   }
 
@@ -26,12 +25,21 @@ module.exports = async function handler(req, res) {
   }
 
   if (!apiKey) {
-    return res.status(500).json({ error: 'Vercel에 GEMINI_API_KEY가 아직 등록되지 않았습니다.' });
+    return res.status(500).json({ error: 'Vercel에 GEMINI_API_KEY가 등록되지 않았습니다.' });
   }
 
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
-    const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+    // 503 과부하 시 자동으로 다음 무료 모델로 우회
+    const rawModels = [
+      process.env.GEMINI_MODEL,
+      'gemini-3.5-flash-lite',
+      'gemini-3.8-flash',
+      'gemini-3.5-flash',
+      'gemini-3.1-flash-lite'
+    ].filter(Boolean);
+    const models = [...new Set(rawModels)];
 
     let payload;
     if (body.contents) {
@@ -61,34 +69,50 @@ module.exports = async function handler(req, res) {
       };
     }
 
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
+    let lastStatus = 500;
+    let lastData = null;
 
-    const data = await response.json();
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: (data && data.error && data.error.message) || 'Gemini API 호출에 실패했습니다.',
-        details: data
+    for (const model of models) {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
       });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        const text =
+          (data &&
+            data.candidates &&
+            data.candidates[0] &&
+            data.candidates[0].content &&
+            data.candidates[0].content.parts &&
+            data.candidates[0].content.parts[0] &&
+            data.candidates[0].content.parts[0].text) ||
+          '';
+
+        return res.status(200).json({
+          text,
+          model,
+          candidates: data.candidates
+        });
+      }
+
+      lastStatus = response.status;
+      lastData = data;
+
+      // 503(과부하), 429(한도), 404(모델 없음), 5xx면 다음 모델로 즉시 우회
+      if ([404, 429, 500, 502, 503, 504].includes(response.status)) {
+        continue;
+      }
+      break;
     }
 
-    const text =
-      (data &&
-        data.candidates &&
-        data.candidates[0] &&
-        data.candidates[0].content &&
-        data.candidates[0].content.parts &&
-        data.candidates[0].content.parts[0] &&
-        data.candidates[0].content.parts[0].text) ||
-      '';
-
-    return res.status(200).json({
-      text,
-      candidates: data.candidates
+    return res.status(lastStatus).json({
+      error: (lastData && lastData.error && lastData.error.message) || 'Gemini API 호출에 실패했습니다.',
+      details: lastData
     });
   } catch (err) {
     return res.status(500).json({ error: err.message || '서버 내부 오류' });
